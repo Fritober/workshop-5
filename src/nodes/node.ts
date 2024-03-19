@@ -1,48 +1,138 @@
 import bodyParser from "body-parser";
 import express from "express";
 import { BASE_NODE_PORT } from "../config";
-import { Value } from "../types";
+import { NodeState, Value } from "../types";
+import http from "http";
 
 export async function node(
-  nodeId: number, // the ID of the node
-  N: number, // total number of nodes in the network
-  F: number, // number of faulty nodes in the network
-  initialValue: Value, // initial value of the node
-  isFaulty: boolean, // true if the node is faulty, false otherwise
-  nodesAreReady: () => boolean, // used to know if all nodes are ready to receive requests
-  setNodeIsReady: (index: number) => void // this should be called when the node is started and ready to receive requests
+    nodeId: number,
+    N: number,
+    F: number,
+    initialValue: Value,
+    isFaulty: boolean,
+    nodesAreReady: () => boolean,
+    setNodeIsReady: (index: number) => void
 ) {
-  const node = express();
-  node.use(express.json());
-  node.use(bodyParser.json());
+  const app = express();
+  app.use(express.json());
+  app.use(bodyParser.json());
 
-  // TODO implement this
-  // this route allows retrieving the current status of the node
-  // node.get("/status", (req, res) => {});
+  const messages: Value[] = [];
 
-  // TODO implement this
-  // this route allows the node to receive messages from other nodes
-  // node.post("/message", (req, res) => {});
+  let killed = isFaulty;
+  let x: 0 | 1 | "?" | null = isFaulty ? null : initialValue;
+  let decided: boolean | null = isFaulty ? null : false;
+  let k: number | null = isFaulty ? null : 0;
 
-  // TODO implement this
-  // this route is used to start the consensus algorithm
-  // node.get("/start", async (req, res) => {});
+  app.get("/status", (req, res) => {
+    if (killed) {
+      res.status(500).send("faulty");
+    } else {
+      res.status(200).send("live");
+    }
+  });
 
-  // TODO implement this
-  // this route is used to stop the consensus algorithm
-  // node.get("/stop", async (req, res) => {});
+  app.post("/message", (req, res) => {
+    const { message } = req.body;
+    messages.push(message);
 
-  // TODO implement this
-  // get the current state of a node
-  // node.get("/getState", (req, res) => {});
+    if (k === null && !killed) {
+      if (Math.random() < 0.5) {
+        const targetNodeId = Math.floor(Math.random() * N);
+        if (x !== null) {
+          sendMessage(targetNodeId, x);
+        }
+      }
 
-  // start the server
-  const server = node.listen(BASE_NODE_PORT + nodeId, async () => {
+      if (messages.length >= N - F) {
+        const onesCount = messages.filter((msg) => msg === 1).length;
+        const zerosCount = messages.length - onesCount;
+        x = onesCount > zerosCount ? 1 : 0;
+        decided = true;
+      }
+    }
+
+    res.send("Message received");
+  });
+
+  app.get("/start", async (req, res) => {
+    if (k === null || killed) {
+      res.status(500).send("Cannot start algorithm on a faulty or stopped node");
+      return;
+    }
+    if (decided === null) {
+      decided = false;
+      k = 0;
+      for (let i = 0; i < F; i++) {
+        const targetNodeId = Math.floor(Math.random() * N);
+        if (targetNodeId !== nodeId) {
+          if (x != null) {
+            sendMessage(targetNodeId, x);
+          }
+        }
+      }
+      k++;
+
+      res.send("Consensus algorithm started");
+    } else {
+      res.status(400).send("Algorithm already started");
+    }
+  });
+
+  app.get("/stop", async (req, res) => {
+    if (k === null || killed) {
+      res.status(500).send("Cannot stop algorithm on a faulty or stopped node");
+      return;
+    }
+
+    if (decided === null) {
+      k = null;
+
+      res.send("Consensus algorithm stopped");
+    } else {
+      res.status(400).send("Algorithm already stopped");
+    }
+  });
+
+  app.get("/getState", (req, res) => {
+    res.json({ killed, x, decided, k });
+  });
+
+  const sendMessage = (targetNodeId: number, message: Value) => {
+    const targetPort = BASE_NODE_PORT + targetNodeId;
+
+    const postData = JSON.stringify({ message });
+
+    const options = {
+      hostname: "localhost",
+      port: targetPort,
+      path: "/message",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(postData),
+      },
+    };
+
+    const req = http.request(options, (res) => {
+      // Handle response if needed
+    });
+
+    req.on("error", (error) => {
+      console.error(`Error sending message to node ${targetNodeId}: ${error.message}`);
+    });
+
+    req.write(postData);
+    req.end();
+  };
+
+  // Start the server
+  const server = app.listen(BASE_NODE_PORT + nodeId, async () => {
     console.log(
-      `Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`
+        `Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`
     );
 
-    // the node is ready
+    // The node is ready
     setNodeIsReady(nodeId);
   });
 
