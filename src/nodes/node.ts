@@ -1,8 +1,15 @@
 import bodyParser from "body-parser";
 import express from "express";
 import { BASE_NODE_PORT } from "../config";
-import { NodeState, Value } from "../types";
-import http from "http";
+import { Value } from "../types";
+import { delay } from "../utils";
+
+type NodeState = {
+  killed: boolean;
+  x: 0 | 1 | "?" | null;
+  decided: boolean | null;
+  k: number | null;
+};
 
 export async function node(
     nodeId: number,
@@ -17,124 +24,160 @@ export async function node(
   app.use(express.json());
   app.use(bodyParser.json());
 
-  const messages: Value[] = [];
-
-  let killed = isFaulty;
-  let x: 0 | 1 | "?" | null = isFaulty ? null : initialValue;
-  let decided: boolean | null = isFaulty ? null : false;
-  let k: number | null = isFaulty ? null : 0;
-
   app.get("/status", (req, res) => {
-    if (killed) {
+    if (isFaulty) {
       res.status(500).send("faulty");
     } else {
       res.status(200).send("live");
     }
   });
 
-  app.post("/message", (req, res) => {
-    const { message } = req.body;
-    messages.push(message);
-
-    if (k === null && !killed) {
-      if (Math.random() < 0.5) {
-        const targetNodeId = Math.floor(Math.random() * N);
-        if (x !== null) {
-          sendMessage(targetNodeId, x);
-        }
-      }
-
-      if (messages.length >= N - F) {
-        const onesCount = messages.filter((msg) => msg === 1).length;
-        const zerosCount = messages.length - onesCount;
-        x = onesCount > zerosCount ? 1 : 0;
-        decided = true;
-      }
+  app.get("/start", async (req, res) => {
+    while (!nodesAreReady()) {
+      await delay(100);
     }
 
-    res.send("Message received");
+    if (!isFaulty) {
+      currentState = {
+        killed: false,
+        x: initialValue,
+        decided: false,
+        k: 1,
+      };
+
+      for (let i = 0; i < N; i++) {
+        sendMessage(BASE_NODE_PORT + i, {
+          k: currentState.k,
+          x: currentState.x,
+          type: "2P",
+        });
+      }
+    } else {
+      currentState = {
+        killed: false,
+        x: null,
+        decided: null,
+        k: null,
+      };
+    }
+
+    res.status(200).send("success");
   });
 
-  app.get("/start", async (req, res) => {
-    if (k === null || killed) {
-      res.status(500).send("Cannot start algorithm on a faulty or stopped node");
-      return;
-    }
-    if (decided === null) {
-      decided = false;
-      k = 0;
-      for (let i = 0; i < F; i++) {
-        const targetNodeId = Math.floor(Math.random() * N);
-        if (targetNodeId !== nodeId) {
-          if (x != null) {
-            sendMessage(targetNodeId, x);
-          }
-        }
-      }
-      k++;
+  let proposalMap: Map<number, Value[]> = new Map();
+  let voteMap: Map<number, Value[]> = new Map();
 
-      res.send("Consensus algorithm started");
-    } else {
-      res.status(400).send("Algorithm already started");
+  let currentState: NodeState = { killed: false, x: initialValue, decided: false, k: 0 };
+
+  app.post("/message", async (req, res) => {
+    const { k: messageK, x: messageX, type: messageType } = req.body;
+
+    if (!currentState.killed && !isFaulty) {
+      if (messageType === "2P") {
+        handle2PMessage(messageK, messageX);
+      } else if (messageType === "2V") {
+        handle2VMessage(messageK, messageX);
+      }
     }
+
+    res.status(200).send("success");
   });
 
   app.get("/stop", async (req, res) => {
-    if (k === null || killed) {
-      res.status(500).send("Cannot stop algorithm on a faulty or stopped node");
-      return;
-    }
-
-    if (decided === null) {
-      k = null;
-
-      res.send("Consensus algorithm stopped");
-    } else {
-      res.status(400).send("Algorithm already stopped");
-    }
+    currentState.killed = true;
+    currentState.x = null;
+    currentState.decided = null;
+    currentState.k = 0;
+    res.send("Node stopped");
   });
 
   app.get("/getState", (req, res) => {
-    res.json({ killed, x, decided, k });
+    if (isFaulty) {
+      res.send({
+        killed: currentState.killed,
+        x: null,
+        decided: null,
+        k: null,
+      });
+    } else {
+      res.send(currentState);
+    }
   });
 
-  const sendMessage = (targetNodeId: number, message: Value) => {
-    const targetPort = BASE_NODE_PORT + targetNodeId;
-
-    const postData = JSON.stringify({ message });
-
-    const options = {
-      hostname: "localhost",
-      port: targetPort,
-      path: "/message",
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(postData),
-      },
-    };
-
-    const req = http.request(options, (res) => {
-      // Handle response if needed
-    });
-
-    req.on("error", (error) => {
-      console.error(`Error sending message to node ${targetNodeId}: ${error.message}`);
-    });
-
-    req.write(postData);
-    req.end();
-  };
-
-  // Start the server
   const server = app.listen(BASE_NODE_PORT + nodeId, async () => {
-    console.log(
-        `Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`
-    );
+    console.log(`Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`);
 
-    // The node is ready
+    // the node is ready
     setNodeIsReady(nodeId);
   });
 
   return server;
+
+  function handle2PMessage(messageK: number, messageX: Value) {
+    if (!proposalMap.has(messageK)) {
+      proposalMap.set(messageK, []);
+    }
+    proposalMap.get(messageK)!.push(messageX);
+
+    const proposal = proposalMap.get(messageK)!;
+    if (proposal.length >= N - F) {
+      const numberOfZeros = proposal.filter((x) => x === 0).length;
+      const numberOfOnes = proposal.filter((x) => x === 1).length;
+      const newX = numberOfZeros > N / 2 ? 0 : numberOfOnes > N / 2 ? 1 : "?";
+
+      for (let i = 0; i < N; i++) {
+        sendMessage(BASE_NODE_PORT + i, { k: messageK, x: newX, type: "2V" });
+      }
+    }
+  }
+
+  function handle2VMessage(messageK: number, messageX: Value) {
+    if (!voteMap.has(messageK)) {
+      voteMap.set(messageK, []);
+    }
+    voteMap.get(messageK)!.push(messageX);
+
+    const vote = voteMap.get(messageK)!;
+    if (vote.length >= N - F) {
+      const numberOfZeros = vote.filter((x) => x === 0).length;
+      const numberOfOnes = vote.filter((x) => x === 1).length;
+
+      if (numberOfZeros >= F + 1) {
+        currentState.x = 0;
+        currentState.decided = true;
+      } else if (numberOfOnes >= F + 1) {
+        currentState.x = 1;
+        currentState.decided = true;
+      } else {
+        const newX =
+            numberOfZeros + numberOfOnes > 0 && numberOfZeros > numberOfOnes
+                ? 0
+                : numberOfZeros + numberOfOnes > 0 && numberOfZeros < numberOfOnes
+                    ? 1
+                    : Math.random() > 0.5
+                        ? 0
+                        : 1;
+        currentState.x = newX;
+        currentState.k = messageK + 1;
+
+        for (let i = 0; i < N; i++) {
+          sendMessage(BASE_NODE_PORT + i, {
+            k: currentState.k,
+            x: currentState.x,
+            type: "2P",
+          });
+        }
+      }
+    }
+  }
+
+  function sendMessage(port: number, message: any) {
+    fetch(`http://localhost:${port}/message`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(message),
+    });
+  }
 }
